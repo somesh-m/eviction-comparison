@@ -1,7 +1,10 @@
 [package]
-name = "hello-rust"
+name = "eviction"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 hashbrown = "0.14"
+rand = "0.8"
+tabular = "0.2.0"
+zipf = "7.0.2"
