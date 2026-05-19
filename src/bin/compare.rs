@@ -20,6 +20,9 @@ use eviction::algorithms::sieve::SieveMap;
 use eviction::algorithms::lru::LruCache;
 use eviction::algorithms::segmented_lru::SegmentedLruCache;
 use eviction::algorithms::w_tiny_lfu::WTinyLfu;
+use eviction::algorithms::hybrid_tiny_lfu::HybridTinyLFU;
+
+use plotters::style::colors::full_palette::ORANGE;
 
 
 #[derive(Debug)]
@@ -149,13 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "SMALL LOAD".to_string(),
     });
 
-    workload_data.push(Workload{
-        num_keys: 5_000_000,
-        total_ops: 50_000_000,
-        total_cache_capacity: 1_250_000,
-        eviction_budget: 1,
-        name: "MEDIUM LOAD".to_string(),
-    });
+    // workload_data.push(Workload{
+    //     num_keys: 5_000_000,
+    //     total_ops: 50_000_000,
+    //     total_cache_capacity: 1_250_000,
+    //     eviction_budget: 1,
+    //     name: "MEDIUM LOAD".to_string(),
+    // });
 
     // workload_data.push(Workload{
     //     num_keys: 10_000_000,
@@ -179,46 +182,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut perf_sieve: Vec<(String, Performance)> = Vec::new();
     let mut perf_lru: Vec<(String, Performance)> = Vec::new();
     let mut perf_segmented_lru: Vec<(String, Performance)> = Vec::new();
+    let mut perf_hybrid_tiny_lfu: Vec<(String, Performance)> = Vec::new();
     let mut perf_w_tiny_lfu: Vec<(String, Performance)> = Vec::new();
 
     let mut hit_rate: f32;
     let mut perf;
     for config in workload_data {
         let workload_name = config.name.clone();
-        // Run the workload on segmented sieve
         let protected_size = (protected_segment_ratio * config.total_cache_capacity as f32) as usize;
-        let mut b_map = MemoryBoundedMap::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget, 1);
-        perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // result_segmented_sieve.push((workload_name.clone(), hit_rate));
-        perf_segmented_sieve.push((workload_name.clone(), perf));
+        // let mut b_map = MemoryBoundedMap::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget, 1);
+        // perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        // perf_segmented_sieve.push((workload_name.clone(), perf));
 
-        // Run the workload on simple sieve algorithm
-        let mut sieve = SieveMap::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // result_sieve.push((workload_name.clone(), hit_rate));
-        perf_sieve.push((workload_name.clone(), perf));
+        // let mut sieve = SieveMap::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
+        // perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        // perf_sieve.push((workload_name.clone(), perf));
 
 
-        //Run the workload on LRU eviction
-        let mut lru = LruCache::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // result_lru.push((workload_name.clone(), hit_rate));
-        perf_lru.push((workload_name.clone(), perf));
+        // let mut lru = LruCache::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
+        // perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        // perf_lru.push((workload_name.clone(), perf));
 
 
-        //Run the workload on Segmented LRU eviction
-        let probation_size = config.total_cache_capacity - protected_size;
-        let mut segmented_lru = SegmentedLruCache::new(config.total_cache_capacity, protected_size, probation_size, probation_size - 100, protected_size - 100, config.eviction_budget, config.eviction_budget, 1);
-        perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // result_segmented_lru.push((workload_name.clone(), hit_rate));
-        perf_segmented_lru.push((workload_name.clone(), perf));
+        // let probation_size = config.total_cache_capacity - protected_size;
+        // let mut segmented_lru = SegmentedLruCache::new(config.total_cache_capacity, protected_size, probation_size, probation_size - 100, protected_size - 100, config.eviction_budget, config.eviction_budget, 1);
+        // perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        // perf_segmented_lru.push((workload_name.clone(), perf));
 
-        //Run the workload on w tiny lfu eviction
-        let mut b_map = WTinyLfu::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget);
-        perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // result_segmented_sieve.push((workload_name.clone(), hit_rate));
+        // let mut hybrid_map = HybridTinyLFU::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget);
+        // perf = run_workload(&mut hybrid_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        // perf_hybrid_tiny_lfu.push((workload_name.clone(), perf));
+
+        let mut tiny_map = WTinyLfu::new(config.total_cache_capacity);
+        perf = run_workload(&mut tiny_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
         perf_w_tiny_lfu.push((workload_name.clone(), perf));
-
     }
 
     let performances = [
@@ -226,6 +223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("Sieve", perf_sieve),
         ("LRU", perf_lru),
         ("Segmented LRU", perf_segmented_lru),
+        ("Hybrid Tiny LFU", perf_hybrid_tiny_lfu),
         ("W Tiny LFU", perf_w_tiny_lfu),
     ];
     plot_perf(&performances)?;
@@ -292,8 +290,10 @@ fn plot_perf(
         let base_color = match algo_idx {
             0 => RED,
             1 => BLUE,
-            2 => MAGENTA, // Distinct color for LRU
-            _ => BLACK,   // Segmented LRU remains Black
+            2 => MAGENTA,
+            3 => BLACK,
+            4 => GREEN,
+            _ => ORANGE,
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
@@ -398,7 +398,9 @@ fn plot_throughput(
             0 => RED,
             1 => BLUE,
             2 => MAGENTA,
-            _ => BLACK,
+            3 => BLACK,
+            4 => GREEN,
+            _ => ORANGE,
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
@@ -497,7 +499,9 @@ fn plot_average_latency(
             0 => RED,
             1 => BLUE,
             2 => MAGENTA,
-            _ => BLACK,
+            3 => BLACK,
+            4 => GREEN,
+            _ => ORANGE,
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
