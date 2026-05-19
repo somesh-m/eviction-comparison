@@ -1,7 +1,7 @@
 use hashbrown::HashMap;
-use hashbrown::hash_map::Entry;
 use tabular::{Table, Row};
 use crate::Cache;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct AlgorithmStats {
@@ -10,9 +10,9 @@ pub struct AlgorithmStats {
     pub probation_pool_size: usize,
     pub protected_eviction_trigger: usize,
     pub protected_eviction_budget: usize,
-    pub probation_used_count: usize,
     pub total_element_count: usize,
     pub total_eviction_count: usize,
+    pub promotion_trigger: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +26,7 @@ pub struct ValueMeta {
     pub key: String,
     pub value: String,
     pub visited: bool,
+    pub access_count: usize,
 }
 
 pub struct MemoryBoundedMap {
@@ -33,7 +34,6 @@ pub struct MemoryBoundedMap {
     pub protected_pool_size: usize,
     pub probation_pool_size: usize,
     pub protected_used_count: usize,
-    pub probation_used_count: usize,
     pub protected_eviction_trigger: usize,
     pub protected_eviction_budget: usize,
     pub protected_pool: Vec<Option<ValueMeta>>,
@@ -43,16 +43,16 @@ pub struct MemoryBoundedMap {
     pub protected_free_list: Vec<usize>,
     pub name: String,
     pub total_eviction_count: usize,
+    pub promotion_trigger: usize,
 }
 
 impl MemoryBoundedMap {
-    pub fn new(protected_size: usize, trigger: usize, probation_size: usize, budget: usize) -> Self {
+    pub fn new(protected_size: usize, trigger: usize, probation_size: usize, budget: usize, promotion_trigger: usize) -> Self {
         Self {
             index_map: HashMap::new(),
             protected_pool_size: protected_size,
             probation_pool_size: probation_size,
             protected_used_count: 0,
-            probation_used_count: 0,
             protected_eviction_trigger: trigger,
             protected_eviction_budget: budget,
             protected_pool: (0..protected_size).map(|_| None).collect(),
@@ -62,6 +62,7 @@ impl MemoryBoundedMap {
             protected_free_list: (0..protected_size).rev().collect(),
             name: "Segmented Admission Control & Sieve Eviction".to_string(),
             total_eviction_count: 0,
+            promotion_trigger: promotion_trigger,
         }
     }
 
@@ -76,30 +77,96 @@ impl MemoryBoundedMap {
             probation_pool_size: self.probation_pool_size,
             protected_eviction_trigger: self.protected_eviction_trigger,
             protected_eviction_budget: self.protected_eviction_budget,
-            probation_used_count: self.probation_used_count,
             total_element_count: self.index_map.len(),
             total_eviction_count: self.total_eviction_count,
+            promotion_trigger: self.promotion_trigger,
         }
     }
 
+    pub fn debug_integrity(&self) {
+        let mut probation_live_slots = 0usize;
+        let mut probation_stale_slots = 0usize;
+        let mut probation_duplicate_slots = 0usize;
+
+        let mut protected_live_slots = 0usize;
+        let mut protected_stale_slots = 0usize;
+        let mut protected_duplicate_slots = 0usize;
+
+        let mut seen_keys: HashSet<&str> = HashSet::new();
+
+        for (idx, slot) in self.probation_pool.iter().enumerate() {
+            if let Some(item) = slot {
+                probation_live_slots += 1;
+
+                if !seen_keys.insert(item.key.as_str()) {
+                    probation_duplicate_slots += 1;
+                }
+
+                match self.index_map.get(&item.key) {
+                    Some(Location::Probation(map_idx)) if *map_idx == idx => {}
+                    _ => {
+                        probation_stale_slots += 1;
+                    }
+                }
+            }
+        }
+
+        for (idx, slot) in self.protected_pool.iter().enumerate() {
+            if let Some(item) = slot {
+                protected_live_slots += 1;
+
+                if !seen_keys.insert(item.key.as_str()) {
+                    protected_duplicate_slots += 1;
+                }
+
+                match self.index_map.get(&item.key) {
+                    Some(Location::Protected(map_idx)) if *map_idx == idx => {}
+                    _ => {
+                        protected_stale_slots += 1;
+                    }
+                }
+            }
+        }
+
+        let pool_unique_keys = seen_keys.len();
+        let index_keys = self.index_map.len();
+
+        println!();
+        println!("--- INTEGRITY DEBUG ---");
+        println!("Index Map Keys           : {}", index_keys);
+        println!("Pool Unique Keys         : {}", pool_unique_keys);
+        println!("Probation Live Slots     : {}", probation_live_slots);
+        println!("Probation Stale Slots    : {}", probation_stale_slots);
+        println!("Probation Duplicates     : {}", probation_duplicate_slots);
+        println!("Protected Live Slots     : {}", protected_live_slots);
+        println!("Protected Stale Slots    : {}", protected_stale_slots);
+        println!("Protected Duplicates     : {}", protected_duplicate_slots);
+        println!("Protected Free List      : {}", self.protected_free_list.len());
+        println!("Total Pool Live Slots    : {}", probation_live_slots + protected_live_slots);
+        println!("------------------------");
+        println!();
+    }
+
     pub fn stats(&mut self) {
-        let mut table = Table::new("{:<} {:>} {:>} {:>} {:>} {:>} {:>} {:>}");
+        let mut table = Table::new("{:<} {:>} {:>} {:>} {:>} {:>} {:>} {:>} {:>}");
         // Add Header Row
         table.add_row(Row::new()
-            .with_cell("Name")
-            .with_cell("Prot Size")
-            .with_cell("Prob Size")
-            .with_cell("E Trig")
-            .with_cell("E Budget")
-            .with_cell("Prot Used")
-            .with_cell("Total Evict")
-            .with_cell("Total Key"));
+            .with_cell("name")
+            .with_cell("prot_size")
+            .with_cell("prob_size")
+            .with_cell("promo_trigger")
+            .with_cell("e_trig")
+            .with_cell("e_budget")
+            .with_cell("prot_used")
+            .with_cell("total_evict")
+            .with_cell("total_key"));
 
         // Add Data Row
         table.add_row(Row::new()
             .with_cell(&self.name)
             .with_cell(self.protected_pool_size.to_string())
             .with_cell(self.probation_pool_size.to_string())
+            .with_cell(self.promotion_trigger.to_string())
             .with_cell(self.protected_eviction_trigger.to_string())
             .with_cell(self.protected_eviction_budget.to_string())
             .with_cell(self.protected_used_count.to_string())
@@ -113,84 +180,106 @@ impl MemoryBoundedMap {
         let loc = *self.index_map.get(key)?;
         match loc {
             Location::Probation(idx) => {
-                self.evict_protected();
+                // Take the item out to mutate/inspect it
                 if let Some(mut item) = self.probation_pool[idx].take() {
+                    // 1. Increment access count and mark visited
+                    item.access_count += 1;
                     item.visited = true;
-                    if let Some(prot_idx) = self.protected_free_list.pop() {
-                        self.protected_pool[prot_idx] = Some(item);
-                        self.index_map.insert(key.to_string(), Location::Protected(prot_idx));
-                        self.probation_used_count -= 1;
-                        self.protected_used_count += 1;
-                        self.protected_pool[prot_idx].as_ref().map(|m| m.value.as_str())
+
+                    // 2. Check if it qualifies for promotion
+                    if item.access_count >= self.promotion_trigger {
+                        self.evict_protected();
+
+                        if let Some(prot_idx) = self.protected_free_list.pop() {
+                            self.protected_pool[prot_idx] = Some(item);
+                            self.index_map.insert(key.to_string(), Location::Protected(prot_idx));
+                            self.protected_used_count += 1;
+                            self.protected_pool[prot_idx].as_ref().map(|m| m.value.as_str())
+                        } else {
+                            // Protected is full even after evict attempt; keep in probation
+                            self.probation_pool[idx] = Some(item);
+                            self.probation_pool[idx].as_ref().map(|m| m.value.as_str())
+                        }
                     } else {
-                        // If protected is full, put it back in probation
+                        // 3. Trigger not met: put it back exactly where it was in probation
                         self.probation_pool[idx] = Some(item);
                         self.probation_pool[idx].as_ref().map(|m| m.value.as_str())
                     }
-                } else { None }
+                } else {
+                    None
+                }
             }
             Location::Protected(idx) => {
                 if let Some(item) = &mut self.protected_pool[idx] {
                     item.visited = true;
+                    item.access_count += 1; // Good practice to track hits here too
                     Some(item.value.as_str())
-                } else { None }
+                } else {
+                    None
+                }
             }
         }
     }
 
     pub fn upsert(&mut self, key: String, value: String) {
-        self.evict_protected();
+        let existing_location = self.index_map.get(&key).copied();
 
-        let victim_key = self.probation_pool[self.probation_hand]
-            .as_ref()
-            .map(|item| item.key.clone());
+        match existing_location {
+            Some(Location::Probation(idx)) => {
+                if let Some(mut item) = self.probation_pool[idx].take() {
+                    item.value = value;
+                    // Increment access count because the key was targeted/hit
+                    item.access_count += 1;
+                    item.visited = true;
 
-        // If there is a victim, remove it from the map first.
-        if let Some(v_key) = victim_key {
-            // Only remove if it's not the same key we are currently upserting.
-            if v_key != key {
-                self.index_map.remove(&v_key);
-            }
-        }
-
-        match self.index_map.entry(key) {
-            Entry::Occupied(mut entry) => match *entry.get() {
-                Location::Probation(idx) => {
-                    if let Some(mut item) = self.probation_pool[idx].take() {
-                        item.value = value;
-                        item.visited = false;
-
+                    // Check if it qualifies for promotion
+                    if item.access_count >= self.promotion_trigger {
+                        self.evict_protected();
                         if let Some(prot_idx) = self.protected_free_list.pop() {
                             self.protected_pool[prot_idx] = Some(item);
-                            entry.insert(Location::Protected(prot_idx));
-
-                            self.probation_used_count -= 1;
+                            self.index_map.insert(key, Location::Protected(prot_idx));
                             self.protected_used_count += 1;
+                        } else {
+                            // Promotion failed because protected pool has no free slot.
+                            // Put the item back into probation, otherwise it is lost.
+                            self.probation_pool[idx] = Some(item);
+                            self.index_map.insert(key, Location::Probation(idx));
                         }
+                    } else {
+                        // Trigger not met: Put the updated item straight back into probation
+                        self.probation_pool[idx] = Some(item);
+                        self.index_map.insert(key, Location::Probation(idx));
                     }
                 }
+            }
 
-                Location::Protected(idx) => {
-                    if let Some(item) = &mut self.protected_pool[idx] {
-                        item.value = value;
-                        item.visited = true;
-                    }
+            Some(Location::Protected(idx)) => {
+                if let Some(item) = &mut self.protected_pool[idx] {
+                    item.value = value;
+                    item.visited = true;
+                    item.access_count += 1; // Increment count here too to track its hotness
                 }
-            },
+            }
 
-            Entry::Vacant(entry) => {
+            None => {
+                //No need for protected eviction as new entry first moves on to the probation pool, which as per this implementation is a circular buffer.
                 let pos = self.probation_hand;
 
+                // Only evict from probation when inserting a brand-new key.
+                if let Some(old_item) = self.probation_pool[pos].take() {
+                    self.index_map.remove(&old_item.key);
+                }
+
+                // Brand new keys start with an access count of 1
                 self.probation_pool[pos] = Some(ValueMeta {
-                    key: entry.key().clone(),
+                    key: key.clone(),
                     value,
                     visited: false,
+                    access_count: 1,
                 });
 
-                entry.insert(Location::Probation(pos));
-
+                self.index_map.insert(key, Location::Probation(pos));
                 self.probation_hand = (pos + 1) % self.probation_pool_size;
-                self.probation_used_count += 1;
             }
         }
     }
@@ -238,6 +327,10 @@ impl Cache for MemoryBoundedMap {
     fn stats(&mut self) {
         self.stats();
     }
+
+    fn debug_integrity(&mut self) {
+        MemoryBoundedMap::debug_integrity(self);
+    }
 }
 
 
@@ -251,7 +344,7 @@ mod tests {
         let protected_trigger = 7;
         let probation_size = 20;
         let eviction_budget = 5;
-        MemoryBoundedMap::new(protected_size, protected_trigger, probation_size, eviction_budget)
+        MemoryBoundedMap::new(protected_size, protected_trigger, probation_size, eviction_budget, 1)
     }
 
     #[test]

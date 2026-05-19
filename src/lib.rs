@@ -4,4 +4,5 @@ pub trait Cache {
     fn get(&mut self, key: &str) -> Option<String>;
     fn name(&self) -> &str;
     fn stats(&mut self);
+    fn debug_integrity(&mut self);
 }

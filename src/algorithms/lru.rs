@@ -3,48 +3,39 @@ use tabular::{Table, Row};
 use crate::Cache;
 
 #[derive(Debug, Clone)]
-pub struct AlgorithmStats {
-    pub algorithm_name: String,
-    pub protected_pool_size: usize,
-    pub probation_pool_size: usize,
-    pub protected_eviction_trigger: usize,
-    pub protected_eviction_budget: usize,
-    pub probation_used_count: usize,
-    pub total_element_count: usize,
-    pub total_eviction_count: usize,
+pub struct LruNode {
+    key: String,
+    value: String,
+    prev: Option<usize>,
+    next: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ValueMeta {
-    pub key: String,
-    pub value: String,
-    pub visited: bool,
-}
-
-pub struct SieveMap {
+pub struct LruCache {
     pub map_size: usize,
     pub index_map: HashMap<String, usize>,
     pub eviction_trigger: usize,
     pub eviction_budget: usize,
-    pub hand: usize,
+    pub head: Option<usize>,
+    pub tail: Option<usize>,
     pub free_list: Vec<usize>,
-    pub entry_list: Vec<Option<ValueMeta>>,
+    pub nodes: Vec<Option<LruNode>>,
     pub name: String,
     pub total_eviction_count: usize,
 }
 
-impl SieveMap {
-    pub fn new(map_size: usize, trigger: usize, budget: usize) -> Self {
+impl LruCache {
+    pub fn new(map_size: usize, trigger: usize, budget: usize) -> Self{
         Self {
             map_size: map_size,
             eviction_trigger: trigger,
             eviction_budget: budget,
-            index_map: HashMap::new(),
-            hand: 0,
+            index_map: HashMap::with_capacity(map_size),
+            head: None,
+            tail: None,
+            nodes: vec![None; map_size],
             free_list: (0..map_size).rev().collect(),
-            entry_list: vec![None; map_size],
+            name: "LRU".to_string(),
             total_eviction_count: 0,
-            name: "Sieve".to_string(),
         }
     }
 
@@ -53,87 +44,131 @@ impl SieveMap {
     }
 
     pub fn stats(&mut self) {
-        let mut table = Table::new("{:<} {:>} {:>} {:>} {:>} {:>}");
-        // Add Header Row
-        table.add_row(Row::new()
-            .with_cell("name")
-            .with_cell("map_capacity")
-            .with_cell("e_trig")
-            .with_cell("e_budget")
-            .with_cell("total_evict")
-            .with_cell("total_key"));
 
-        // Add Data Row
-        table.add_row(Row::new()
-            .with_cell(&self.name)
-            .with_cell(self.map_size.to_string())
-            .with_cell(self.eviction_trigger.to_string())
-            .with_cell(self.eviction_budget.to_string())
-            .with_cell(self.total_eviction_count.to_string())
-            .with_cell(self.index_map.len().to_string()));
-
-        println!("{}", table);
-    }
-
-    pub fn get(&mut self, key: &str) -> Option<&str> {
-        // 1. Get the index from the map
-        if let Some(&idx) = self.index_map.get(key) {
-            // 2. Access the actual metadata in the entry_list
-            if let Some(item) = &mut self.entry_list[idx] {
-                // 3. Mark as visited (the Sieve/Clock logic)
-                item.visited = true;
-                // 4. Return the value as a borrowed &str
-                return Some(&item.value);
-            }
-        }
-        None
     }
 
     pub fn upsert(&mut self, key: String, value: String) {
         if let Some(&idx) = self.index_map.get(&key) {
-            if let Some(item) = &mut self.entry_list[idx] {
+            if let Some(ref mut item) = self.nodes[idx] {
                 item.value = value;
-                item.visited = true;
             }
+            self.detach_node(idx);
+            self.push_head(idx);
         } else {
-            self.evict();
-            if let Some(idx) = self.free_list.pop() {
-                self.index_map.insert(key.clone(), idx);
-                self.entry_list[idx] = Some(ValueMeta {
-                    key,
-                    value,
-                    visited: true
-                });
-            }
+            //new element insert
+            self.evict_tail();
+            let node_idx = if let Some(recycled_idx) = self.free_list.pop() {
+                recycled_idx
+            } else {
+                let new_idx = self.nodes.len();
+                self.nodes.push(None);
+                new_idx
+            };
+            //Construct the object
+            self.nodes[node_idx] = Some(LruNode {
+                key: key.clone(),
+                value,
+                prev: None,
+                next: None
+            });
+            self.index_map.insert(key, node_idx);
+            self.push_head(node_idx);
         }
     }
 
-    fn evict(&mut self) {
-        if (self.map_size - self.free_list.len()) >= self.eviction_trigger {
-            let mut evicted = 0;
+    pub fn get(&mut self, key: &str) -> Option<&str> {
+        if let Some(&node_idx) = self.index_map.get(key) {
+            self.detach_node(node_idx);
+            self.push_head(node_idx);
+            self.nodes[node_idx].as_ref().map(|node| node.value.as_str())
+        } else {
+            None
+        }
+    }
+
+    fn evict_tail(&mut self) {
+        if self.index_map.len() >= self.eviction_trigger {
+            let mut eviction_count = 0;
             loop {
-                let idx = self.hand;
-                if let Some(mut item) = self.entry_list[idx].take() {
-                    if item.visited {
-                        item.visited = false;
-                        self.entry_list[idx] = Some(item);
-                    } else {
-                        self.index_map.remove(&item.key);
-                        self.free_list.push(idx);
-                        evicted += 1;
-                    }
-                }
-                self.hand = (idx + 1) % self.map_size;
-                if evicted >= self.eviction_budget {
+                if eviction_count >= self.eviction_budget {
                     break;
                 }
+                if let Some(tail_idx) = self.tail {
+                    self.detach_node(tail_idx);
+
+                    if let Some(evicted_node) = self.nodes[tail_idx].take() {
+                        self.index_map.remove(&evicted_node.key);
+                    }
+                    self.total_eviction_count += 1;
+                    self.free_list.push(tail_idx);
+                    eviction_count += 1;
+                }
             }
-            self.total_eviction_count += evicted;
+
+        }
+    }
+
+    fn detach_node(&mut self, idx: usize) {
+        // 1. Extract the neighbor indices from the target node safely.
+        // We unwrap the outer Option wrapper because we know this node exists.
+        let (prev_idx, next_idx) = {
+            let node = self.nodes[idx].as_ref().unwrap();
+            (node.prev, node.next)
+        };
+
+        // 2. Fix the Left Neighbor: Point its 'next' over to our 'next_idx'
+        if let Some(p) = prev_idx {
+            if let Some(prev_node) = &mut self.nodes[p] {
+                prev_node.next = next_idx;
+            }
+        } else {
+            // If there was no previous neighbor, this node was the head!
+            self.head = next_idx;
+        }
+
+        // 3. Fix the Right Neighbor: Point its 'prev' back to our 'prev_idx'
+        if let Some(n) = next_idx {
+            if let Some(next_node) = &mut self.nodes[n] {
+                next_node.prev = prev_idx;
+            }
+        } else {
+            // If there was no next neighbor, this node was the tail!
+            self.tail = prev_idx;
+        }
+    }
+
+    fn push_head(&mut self, idx: usize) {
+        // Case A: The list already has an existing head node
+        if let Some(old_head_idx) = self.head {
+            // 1. Make the old head's 'prev' point back to our new node index
+            if let Some(old_head_node) = &mut self.nodes[old_head_idx] {
+                old_head_node.prev = Some(idx);
+            }
+
+            // 2. Link our new node's forward pointer to that old head index
+            if let Some(new_node) = &mut self.nodes[idx] {
+                new_node.next = Some(old_head_idx);
+                new_node.prev = None; // Heads never have a previous neighbor
+            }
+
+            // 3. Globally promote this index to the cache head
+            self.head = Some(idx);
+        }
+        // Case B: The list is completely empty (First node ever inserted)
+        else {
+            if let Some(new_node) = &mut self.nodes[idx] {
+                new_node.prev = None;
+                new_node.next = None;
+            }
+            // When there is only one element, it acts as both the Head and the Tail
+            self.head = Some(idx);
+            self.tail = Some(idx);
         }
     }
 }
 
-impl Cache for SieveMap {
+
+impl Cache for LruCache {
     fn upsert(&mut self, key: String, value: String) {
         self.upsert(key, value);
     }
@@ -161,9 +196,9 @@ mod tests {
     use super::*;
 
     // Helper to setup the cache
-    fn setup_cache(map_size: usize, trigger: usize, budget: usize) -> SieveMap {
+    fn setup_cache(map_size: usize, trigger: usize, budget: usize) -> LruCache {
 
-        SieveMap::new(map_size, trigger, budget)
+        LruCache::new(map_size, trigger, budget)
     }
 
     #[test]
@@ -264,3 +299,4 @@ mod tests {
         assert_eq!(discrepancy_count, 0, "There should be no discrepancy in the values");
     }
 }
+

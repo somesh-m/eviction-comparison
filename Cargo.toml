@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 hashbrown = "0.14"
+plotters = "0.3.7"
+probabilistic-collections = "0.7.0"
 rand = "0.8"
 tabular = "0.2.0"
+textplots = "0.8.7"
 zipf = "7.0.2"
