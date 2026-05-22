@@ -152,13 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "SMALL LOAD".to_string(),
     });
 
-    // workload_data.push(Workload{
-    //     num_keys: 5_000_000,
-    //     total_ops: 50_000_000,
-    //     total_cache_capacity: 1_250_000,
-    //     eviction_budget: 1,
-    //     name: "MEDIUM LOAD".to_string(),
-    // });
+    workload_data.push(Workload{
+        num_keys: 5_000_000,
+        total_ops: 50_000_000,
+        total_cache_capacity: 1_250_000,
+        eviction_budget: 1,
+        name: "MEDIUM LOAD".to_string(),
+    });
 
     // workload_data.push(Workload{
     //     num_keys: 10_000_000,
@@ -190,31 +190,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for config in workload_data {
         let workload_name = config.name.clone();
         let protected_size = (protected_segment_ratio * config.total_cache_capacity as f32) as usize;
-        // let mut b_map = MemoryBoundedMap::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget, 1);
-        // perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // perf_segmented_sieve.push((workload_name.clone(), perf));
+        let mut b_map = MemoryBoundedMap::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget, 1);
+        perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf_segmented_sieve.push((workload_name.clone(), perf));
 
-        // let mut sieve = SieveMap::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        // perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // perf_sieve.push((workload_name.clone(), perf));
-
-
-        // let mut lru = LruCache::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        // perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // perf_lru.push((workload_name.clone(), perf));
+        let mut sieve = SieveMap::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
+        perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf_sieve.push((workload_name.clone(), perf));
 
 
-        // let probation_size = config.total_cache_capacity - protected_size;
-        // let mut segmented_lru = SegmentedLruCache::new(config.total_cache_capacity, protected_size, probation_size, probation_size - 100, protected_size - 100, config.eviction_budget, config.eviction_budget, 1);
-        // perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // perf_segmented_lru.push((workload_name.clone(), perf));
+        let mut lru = LruCache::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
+        perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf_lru.push((workload_name.clone(), perf));
 
-        // let mut hybrid_map = HybridTinyLFU::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget);
-        // perf = run_workload(&mut hybrid_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
-        // perf_hybrid_tiny_lfu.push((workload_name.clone(), perf));
+
+        let probation_size = config.total_cache_capacity - protected_size;
+        let mut segmented_lru = SegmentedLruCache::new(config.total_cache_capacity, protected_size, probation_size, probation_size - 100, protected_size - 100, config.eviction_budget, config.eviction_budget, 1);
+        perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf_segmented_lru.push((workload_name.clone(), perf));
+
+        let mut hybrid_map = HybridTinyLFU::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget);
+        perf = run_workload(&mut hybrid_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf_hybrid_tiny_lfu.push((workload_name.clone(), perf));
 
         let mut tiny_map = WTinyLfu::new(config.total_cache_capacity);
-        perf = run_workload(&mut tiny_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut tiny_map, config.num_keys, config.total_ops, config.total_cache_capacity/2, workload_name.clone());
         perf_w_tiny_lfu.push((workload_name.clone(), perf));
     }
 

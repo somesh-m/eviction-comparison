@@ -1,8 +1,8 @@
-use hashbrown::HashMap;
-use tabular::{Table, Row};
 use crate::Cache;
-use std::collections::{HashSet, VecDeque};
+use hashbrown::HashMap;
 use probabilistic_collections::count_min_sketch::{CountMinSketch, CountMinStrategy};
+use std::collections::HashSet;
+use tabular::{Row, Table};
 
 #[derive(Debug, Clone)]
 pub struct AlgorithmStats {
@@ -12,6 +12,12 @@ pub struct AlgorithmStats {
     pub protected_size: usize,
     pub total_element_count: usize,
     pub total_eviction_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeRef {
+    idx: usize,
+    location: Location,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,51 +31,87 @@ pub enum Location {
 pub struct ValueMeta {
     pub key: String,
     pub value: String,
+    prev: Option<usize>,
+    next: Option<usize>,
+    location: Location,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SegmentState {
+    head: Option<usize>,
+    tail: Option<usize>,
+    len: usize,
+    max: usize,
+}
+
+impl SegmentState {
+    fn new(max: usize) -> Self {
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
+            max,
+        }
+    }
 }
 
 pub struct WTinyLfu {
-    pub index_map: HashMap<String, Location>,
+    index_map: HashMap<String, NodeRef>,
 
     pub window_max: usize,
     pub probation_max: usize,
     pub protected_max: usize,
 
-    pub window_queue: VecDeque<ValueMeta>,
-    pub probation_queue: VecDeque<ValueMeta>,
-    pub protected_queue: VecDeque<ValueMeta>,
+    window: SegmentState,
+    probation: SegmentState,
+    protected: SegmentState,
+
+    nodes: Vec<Option<ValueMeta>>,
+    free_list: Vec<usize>,
 
     pub name: String,
     pub total_eviction_count: usize,
     pub error_tolerance: f64,
     pub confidence: f64,
-    pub sketch: CountMinSketch::<CountMinStrategy, String>,
+    pub sketch: CountMinSketch<CountMinStrategy, String>,
 }
 
 impl WTinyLfu {
     pub fn new(total_capacity: usize) -> Self {
-        // Enforce a strict partitioning layout: 10% Window, 18% Probation, 72% Protected
-        // ensuring even low capacities have workable segment boundaries.
-        let window_max = std::cmp::max(1, (total_capacity as f64 * 0.10) as usize);
-        let remaining = total_capacity - window_max;
-        let probation_max = std::cmp::max(1, (remaining as f64 * 0.20) as usize);
+        let window_max = if total_capacity == 0 {
+            0
+        } else {
+            std::cmp::max(1, (total_capacity as f64 * 0.10) as usize)
+        };
+        let remaining = total_capacity.saturating_sub(window_max);
+        let probation_max = if remaining == 0 {
+            0
+        } else {
+            std::cmp::max(1, (remaining as f64 * 0.20) as usize)
+        };
         let protected_max = remaining - probation_max;
 
         let error_tolerance = 0.01;
         let confidence = 0.99;
 
         Self {
-            index_map: HashMap::new(),
+            index_map: HashMap::with_capacity(total_capacity),
             window_max,
             probation_max,
             protected_max,
-            window_queue: VecDeque::with_capacity(window_max),
-            probation_queue: VecDeque::with_capacity(probation_max),
-            protected_queue: VecDeque::with_capacity(protected_max),
+            window: SegmentState::new(window_max),
+            probation: SegmentState::new(probation_max),
+            protected: SegmentState::new(protected_max),
+            nodes: vec![None; total_capacity],
+            free_list: (0..total_capacity).rev().collect(),
             name: "Original W-TinyLFU (Window LRU + Segmented Main LRU)".to_string(),
             total_eviction_count: 0,
             error_tolerance,
             confidence,
-            sketch: CountMinSketch::<CountMinStrategy, String>::from_error(confidence, error_tolerance),
+            sketch: CountMinSketch::<CountMinStrategy, String>::from_error(
+                confidence,
+                error_tolerance,
+            ),
         }
     }
 
@@ -81,140 +123,277 @@ impl WTinyLfu {
         self.sketch.insert(key, 1);
     }
 
-    fn touch_node(&mut self, key: &str, current_loc: Location) {
-        match current_loc {
-            Location::Window => {
-                if let Some(idx) = self.window_queue.iter().position(|x| x.key == key) {
-                    if let Some(item) = self.window_queue.remove(idx) {
-                        self.window_queue.push_back(item);
-                    }
-                }
-            }
-            Location::Probation => {
-                if let Some(idx) = self.probation_queue.iter().position(|x| x.key == key) {
-                    if let Some(item) = self.probation_queue.remove(idx) {
-                        self.promote_to_protected(item);
-                    }
-                }
-            }
-            Location::Protected => {
-                if let Some(idx) = self.protected_queue.iter().position(|x| x.key == key) {
-                    if let Some(item) = self.protected_queue.remove(idx) {
-                        self.protected_queue.push_back(item);
-                    }
-                }
-            }
+    fn alloc_node(&mut self, key: String, value: String) -> usize {
+        let idx = if let Some(idx) = self.free_list.pop() {
+            idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(None);
+            idx
+        };
+
+        self.nodes[idx] = Some(ValueMeta {
+            key: key.clone(),
+            value,
+            prev: None,
+            next: None,
+            location: Location::Window,
+        });
+        self.index_map.insert(
+            key,
+            NodeRef {
+                idx,
+                location: Location::Window,
+            },
+        );
+        idx
+    }
+
+    fn segment(&self, location: Location) -> &SegmentState {
+        match location {
+            Location::Window => &self.window,
+            Location::Probation => &self.probation,
+            Location::Protected => &self.protected,
         }
     }
 
-    fn promote_to_protected(&mut self, item: ValueMeta) {
-        if self.protected_queue.len() >= self.protected_max {
-            if let Some(demoted) = self.protected_queue.pop_front() {
-                self.index_map.insert(demoted.key.clone(), Location::Probation);
-                self.probation_queue.push_back(demoted);
+    fn segment_mut(&mut self, location: Location) -> &mut SegmentState {
+        match location {
+            Location::Window => &mut self.window,
+            Location::Probation => &mut self.probation,
+            Location::Protected => &mut self.protected,
+        }
+    }
 
-                if self.probation_queue.len() > self.probation_max {
-                    self.evict_from_probation();
+    fn key_for_idx(&self, idx: usize) -> &str {
+        self.nodes[idx].as_ref().unwrap().key.as_str()
+    }
+
+    fn value_for_idx(&self, idx: usize) -> &str {
+        self.nodes[idx].as_ref().unwrap().value.as_str()
+    }
+
+    fn location_for_idx(&self, idx: usize) -> Location {
+        self.nodes[idx].as_ref().unwrap().location
+    }
+
+    fn detach(&mut self, idx: usize) {
+        let (prev_idx, next_idx, location) = {
+            let node = self.nodes[idx].as_ref().unwrap();
+            (node.prev, node.next, node.location)
+        };
+
+        if let Some(prev_idx) = prev_idx {
+            if let Some(prev_node) = &mut self.nodes[prev_idx] {
+                prev_node.next = next_idx;
+            }
+        } else {
+            self.segment_mut(location).head = next_idx;
+        }
+
+        if let Some(next_idx) = next_idx {
+            if let Some(next_node) = &mut self.nodes[next_idx] {
+                next_node.prev = prev_idx;
+            }
+        } else {
+            self.segment_mut(location).tail = prev_idx;
+        }
+
+        if let Some(node) = &mut self.nodes[idx] {
+            node.prev = None;
+            node.next = None;
+        }
+
+        self.segment_mut(location).len -= 1;
+    }
+
+    fn push_back(&mut self, idx: usize, location: Location) {
+        let old_tail = self.segment(location).tail;
+
+        if let Some(node) = &mut self.nodes[idx] {
+            node.location = location;
+            node.prev = old_tail;
+            node.next = None;
+        }
+
+        if let Some(old_tail) = old_tail {
+            if let Some(tail_node) = &mut self.nodes[old_tail] {
+                tail_node.next = Some(idx);
+            }
+        } else {
+            self.segment_mut(location).head = Some(idx);
+        }
+
+        self.segment_mut(location).tail = Some(idx);
+        self.segment_mut(location).len += 1;
+
+        let key = self.key_for_idx(idx);
+        let current = self.index_map.get(key).copied();
+        if current != Some(NodeRef { idx, location }) {
+            self.index_map
+                .insert(key.to_string(), NodeRef { idx, location });
+        }
+    }
+
+    fn pop_front(&mut self, location: Location) -> Option<usize> {
+        let head = self.segment(location).head?;
+        self.detach(head);
+        Some(head)
+    }
+
+    fn move_to_back(&mut self, idx: usize) {
+        let location = self.location_for_idx(idx);
+        if self.segment(location).tail == Some(idx) {
+            return;
+        }
+        self.detach(idx);
+        self.push_back(idx, location);
+    }
+
+    fn remove_node(&mut self, idx: usize) {
+        let node = self.nodes[idx].take().unwrap();
+        self.index_map.remove(node.key.as_str());
+        self.free_list.push(idx);
+        self.total_eviction_count += 1;
+    }
+
+    fn remove_detached_node(&mut self, idx: usize) {
+        self.remove_node(idx);
+    }
+
+    fn promote_to_protected(&mut self, idx: usize) {
+        self.detach(idx);
+
+        if self.protected_max == 0 {
+            self.push_back(idx, Location::Probation);
+            return;
+        }
+
+        if self.protected.len >= self.protected.max {
+            if let Some(demoted_idx) = self.pop_front(Location::Protected) {
+                if self.probation_max == 0 {
+                    self.remove_detached_node(demoted_idx);
+                } else {
+                    self.push_back(demoted_idx, Location::Probation);
+                    if self.probation.len > self.probation.max {
+                        if let Some(evicted_idx) = self.pop_front(Location::Probation) {
+                            self.remove_detached_node(evicted_idx);
+                        }
+                    }
                 }
             }
         }
-        self.index_map.insert(item.key.clone(), Location::Protected);
-        self.protected_queue.push_back(item);
-    }
 
-    fn evict_from_probation(&mut self) {
-        if let Some(evicted) = self.probation_queue.pop_front() {
-            self.index_map.remove(&evicted.key);
-            self.total_eviction_count += 1;
-        }
+        self.push_back(idx, Location::Protected);
     }
 
     pub fn get(&mut self, key: &str) -> Option<&str> {
         self.update_freq_map(key);
-        let loc = *self.index_map.get(key)?;
 
-        self.touch_node(key, loc);
-
-        let final_loc = self.index_map.get(key)?;
-        match final_loc {
-            Location::Window => self.window_queue.iter().find(|x| x.key == key).map(|x| x.value.as_str()),
-            Location::Probation => self.probation_queue.iter().find(|x| x.key == key).map(|x| x.value.as_str()),
-            Location::Protected => self.protected_queue.iter().find(|x| x.key == key).map(|x| x.value.as_str()),
+        let entry = *self.index_map.get(key)?;
+        match entry.location {
+            Location::Window => self.move_to_back(entry.idx),
+            Location::Probation => self.promote_to_protected(entry.idx),
+            Location::Protected => self.move_to_back(entry.idx),
         }
+
+        let idx = self.index_map.get(key)?.idx;
+        Some(self.value_for_idx(idx))
     }
 
     pub fn upsert(&mut self, key: String, value: String) {
-        self.update_freq_map(&key);
-
-        if let Some(&loc) = self.index_map.get(&key) {
-            match loc {
-                Location::Window => {
-                    if let Some(item) = self.window_queue.iter_mut().find(|x| x.key == key) { item.value = value; }
-                }
-                Location::Probation => {
-                    if let Some(item) = self.probation_queue.iter_mut().find(|x| x.key == key) { item.value = value; }
-                }
-                Location::Protected => {
-                    if let Some(item) = self.protected_queue.iter_mut().find(|x| x.key == key) { item.value = value; }
-                }
-            }
-            self.touch_node(&key, loc);
+        if self.window_max == 0 && self.probation_max == 0 && self.protected_max == 0 {
+            self.total_eviction_count += 1;
             return;
         }
 
-        let new_item = ValueMeta { key: key.clone(), value };
-        self.window_queue.push_back(new_item);
-        self.index_map.insert(key, Location::Window);
+        self.update_freq_map(&key);
 
-        if self.window_queue.len() > self.window_max {
-            if let Some(window_evictee) = self.window_queue.pop_front() {
-                self.admit_to_main_cache(window_evictee);
+        if let Some(entry) = self.index_map.get(&key).copied() {
+            if let Some(node) = &mut self.nodes[entry.idx] {
+                node.value = value;
             }
+
+            match entry.location {
+                Location::Window => self.move_to_back(entry.idx),
+                Location::Probation => self.promote_to_protected(entry.idx),
+                Location::Protected => self.move_to_back(entry.idx),
+            }
+            return;
+        }
+
+        let idx = self.alloc_node(key, value);
+
+        if self.window_max > 0 {
+            self.push_back(idx, Location::Window);
+            if self.window.len > self.window.max {
+                if let Some(window_evictee) = self.pop_front(Location::Window) {
+                    self.admit_to_main_cache(window_evictee);
+                }
+            }
+        } else {
+            self.admit_to_main_cache(idx);
         }
     }
 
-    fn admit_to_main_cache(&mut self, candidate: ValueMeta) {
-        if self.probation_queue.len() < self.probation_max {
-            self.index_map.insert(candidate.key.clone(), Location::Probation);
-            self.probation_queue.push_back(candidate);
+    fn admit_to_main_cache(&mut self, candidate_idx: usize) {
+        if self.probation_max == 0 {
+            if self.protected_max == 0 {
+                self.remove_detached_node(candidate_idx);
+                return;
+            }
+
+            if self.protected.len >= self.protected.max {
+                if let Some(evicted_idx) = self.pop_front(Location::Protected) {
+                    self.remove_detached_node(evicted_idx);
+                }
+            }
+
+            self.push_back(candidate_idx, Location::Protected);
             return;
         }
 
-        if let Some(probation_victim) = self.probation_queue.front() {
-            let candidate_freq = self.sketch.count(&candidate.key);
-            let victim_freq = self.sketch.count(&probation_victim.key);
+        if self.probation.len < self.probation.max {
+            self.push_back(candidate_idx, Location::Probation);
+            return;
+        }
+
+        if let Some(probation_victim_idx) = self.probation.head {
+            let candidate_freq = self.sketch.count(self.key_for_idx(candidate_idx));
+            let victim_freq = self.sketch.count(self.key_for_idx(probation_victim_idx));
 
             if candidate_freq > victim_freq {
-                if let Some(evicted) = self.probation_queue.pop_front() {
-                    self.index_map.remove(&evicted.key);
-                    self.total_eviction_count += 1;
+                if let Some(evicted_idx) = self.pop_front(Location::Probation) {
+                    self.remove_detached_node(evicted_idx);
                 }
-                self.index_map.insert(candidate.key.clone(), Location::Probation);
-                self.probation_queue.push_back(candidate);
+                self.push_back(candidate_idx, Location::Probation);
             } else {
-                self.index_map.remove(&candidate.key);
-                self.total_eviction_count += 1;
+                self.remove_detached_node(candidate_idx);
             }
         }
     }
 
     pub fn stats(&mut self) {
         let mut table = Table::new("{:<} {:>} {:>} {:>} {:>} {:>}");
-        table.add_row(Row::new()
-            .with_cell("name")
-            .with_cell("win_size")
-            .with_cell("prob_size")
-            .with_cell("prot_size")
-            .with_cell("total_evict")
-            .with_cell("total_keys"));
+        table.add_row(
+            Row::new()
+                .with_cell("name")
+                .with_cell("win_size")
+                .with_cell("prob_size")
+                .with_cell("prot_size")
+                .with_cell("total_evict")
+                .with_cell("total_keys"),
+        );
 
-        table.add_row(Row::new()
-            .with_cell(&self.name)
-            .with_cell(self.window_queue.len().to_string())
-            .with_cell(self.probation_queue.len().to_string())
-            .with_cell(self.protected_queue.len().to_string())
-            .with_cell(self.total_eviction_count.to_string())
-            .with_cell(self.index_map.len().to_string()));
+        table.add_row(
+            Row::new()
+                .with_cell(&self.name)
+                .with_cell(self.window.len.to_string())
+                .with_cell(self.probation.len.to_string())
+                .with_cell(self.protected.len.to_string())
+                .with_cell(self.total_eviction_count.to_string())
+                .with_cell(self.index_map.len().to_string()),
+        );
 
         println!("{}", table);
     }
@@ -222,50 +401,94 @@ impl WTinyLfu {
     pub fn debug_integrity(&self) {
         let mut seen_keys = HashSet::new();
 
-        for item in &self.window_queue {
-            assert!(seen_keys.insert(&item.key), "Duplicate key found in window_queue");
-            assert_eq!(self.index_map.get(&item.key), Some(&Location::Window));
+        for location in [Location::Window, Location::Probation, Location::Protected] {
+            let mut count = 0usize;
+            let mut cursor = self.segment(location).head;
+            let mut prev = None;
+
+            while let Some(idx) = cursor {
+                let node = self.nodes[idx].as_ref().unwrap();
+
+                assert_eq!(node.location, location, "Node stored in wrong segment");
+                assert_eq!(node.prev, prev, "Broken prev link");
+                assert_eq!(
+                    self.index_map.get(&node.key),
+                    Some(&NodeRef { idx, location })
+                );
+                assert!(seen_keys.insert(node.key.as_str()), "Duplicate key found in segments");
+
+                prev = Some(idx);
+                cursor = node.next;
+                count += 1;
+            }
+
+            assert_eq!(prev, self.segment(location).tail, "Broken tail pointer");
+            assert_eq!(count, self.segment(location).len, "Segment length mismatch");
+            assert!(
+                self.segment(location).len <= self.segment(location).max,
+                "Segment exceeds configured capacity"
+            );
         }
-        for item in &self.probation_queue {
-            assert!(seen_keys.insert(&item.key), "Duplicate key found in probation_queue");
-            assert_eq!(self.index_map.get(&item.key), Some(&Location::Probation));
-        }
-        for item in &self.protected_queue {
-            assert!(seen_keys.insert(&item.key), "Duplicate key found in protected_queue");
-            assert_eq!(self.index_map.get(&item.key), Some(&Location::Protected));
-        }
-        assert_eq!(seen_keys.len(), self.index_map.len(), "Index map and queue sizes misaligned");
+
+        assert_eq!(seen_keys.len(), self.index_map.len(), "Index map size mismatch");
     }
+    #[cfg(test)]
+    fn segment_keys(&self, location: Location) -> Vec<&str> {
+        let mut keys = Vec::new();
+        let mut cursor = self.segment(location).head;
+
+        while let Some(idx) = cursor {
+            let node = self.nodes[idx].as_ref().unwrap();
+            keys.push(node.key.as_str());
+            cursor = node.next;
+        }
+
+        keys
+    }
+
 }
 
 impl Cache for WTinyLfu {
-    fn upsert(&mut self, key: String, value: String) { self.upsert(key, value); }
-    fn get(&mut self, key: &str) -> Option<String> { self.get(key).map(|s| s.to_string()) }
-    fn name(&self) -> &str { self.name() }
-    fn stats(&mut self) { self.stats(); }
-    fn debug_integrity(&mut self) { (self as &WTinyLfu).debug_integrity(); }
-}
+    fn upsert(&mut self, key: String, value: String) {
+        self.upsert(key, value);
+    }
 
+    fn get(&mut self, key: &str) -> Option<String> {
+        self.get(key).map(|s| s.to_string())
+    }
+
+    fn name(&self) -> &str {
+        self.name()
+    }
+
+    fn stats(&mut self) {
+        self.stats();
+    }
+
+    fn debug_integrity(&mut self) {
+        (self as &WTinyLfu).debug_integrity();
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // A capacity of 10 results in:
-    // Window capacity = 1
-    // Main capacity = 9 -> Probation (20% of 9) = 1, Protected (remaining) = 8
     fn setup_small_cache() -> WTinyLfu {
         WTinyLfu::new(10)
+    }
+
+    fn location_of(cache: &WTinyLfu, key: &str) -> Option<Location> {
+        cache.index_map.get(key).map(|entry| entry.location)
     }
 
     #[test]
     fn test_unconditional_window_admission() {
         let mut cache = setup_small_cache();
 
-        // 1. Insert first item. It must be admitted into the Window unconditionally.
         cache.upsert("key_1".to_string(), "val_1".to_string());
-        assert_eq!(cache.index_map.get("key_1"), Some(&Location::Window));
-        assert_eq!(cache.window_queue.len(), 1);
+        assert_eq!(location_of(&cache, "key_1"), Some(Location::Window));
+        assert_eq!(cache.window.len, 1);
         cache.debug_integrity();
     }
 
@@ -273,36 +496,29 @@ mod tests {
     fn test_window_overflow_to_empty_probation() {
         let mut cache = setup_small_cache();
 
-        // 1. Fill window (size 1)
         cache.upsert("key_1".to_string(), "val_1".to_string());
-
-        // 2. Insert second item. "key_1" overflows window.
-        // Since Probation is empty (max 1), "key_1" moves to Probation without dueling.
         cache.upsert("key_2".to_string(), "val_2".to_string());
 
-        assert_eq!(cache.index_map.get("key_2"), Some(&Location::Window));
-        assert_eq!(cache.index_map.get("key_1"), Some(&Location::Probation));
-        assert_eq!(cache.probation_queue.len(), 1);
-        // cache.debug_integrity();
+        assert_eq!(location_of(&cache, "key_2"), Some(Location::Window));
+        assert_eq!(location_of(&cache, "key_1"), Some(Location::Probation));
+        assert_eq!(cache.probation.len, 1);
+        cache.debug_integrity();
     }
 
     #[test]
     fn test_admission_duel_rejection() {
         let mut cache = setup_small_cache();
 
-        cache.upsert("key_1".to_string(), "val_1".to_string()); // Moves to Probation eventually
-        cache.upsert("key_2".to_string(), "val_2".to_string()); // Now in Window, pushes key_1 to Probation
-        cache.upsert("key_3".to_string(), "val_3".to_string()); // Now in Window, pushes key_2 to Duel
+        cache.upsert("key_1".to_string(), "val_1".to_string());
+        cache.upsert("key_2".to_string(), "val_2".to_string());
+        cache.upsert("key_3".to_string(), "val_3".to_string());
 
-        // Boost historical frequency of probation resident ("key_1")
         cache.update_freq_map("key_1");
         cache.update_freq_map("key_1");
 
-        // "key_2" will be evicted from Window and duel "key_1".
-        // "key_2" has lower frequency than "key_1", so "key_2" is fully rejected/evicted.
         assert_eq!(cache.index_map.get("key_2"), None);
         assert_eq!(cache.total_eviction_count, 1);
-        // cache.debug_integrity();
+        cache.debug_integrity();
     }
 
     #[test]
@@ -312,18 +528,15 @@ mod tests {
         cache.upsert("key_1".to_string(), "val_1".to_string());
         cache.upsert("key_2".to_string(), "val_2".to_string());
 
-        // Artificially make the incoming window evictee ("key_2") hotter than probation resident ("key_1")
         cache.update_freq_map("key_2");
         cache.update_freq_map("key_2");
 
-        // Triggering another insert pushes key_2 out of Window to duel key_1 in Probation
         cache.upsert("key_3".to_string(), "val_3".to_string());
 
-        // "key_2" wins the duel! "key_1" gets permanently evicted out of Probation.
-        assert_eq!(cache.index_map.get("key_1"), None);
-        assert_eq!(cache.index_map.get("key_2"), Some(&Location::Probation));
-        assert_eq!(cache.index_map.get("key_3"), Some(&Location::Window));
-        // cache.debug_integrity();
+        assert_eq!(location_of(&cache, "key_1"), None);
+        assert_eq!(location_of(&cache, "key_2"), Some(Location::Probation));
+        assert_eq!(location_of(&cache, "key_3"), Some(Location::Window));
+        cache.debug_integrity();
     }
 
     #[test]
@@ -331,43 +544,55 @@ mod tests {
         let mut cache = setup_small_cache();
 
         cache.upsert("key_1".to_string(), "val_1".to_string());
-        cache.upsert("key_2".to_string(), "val_2".to_string()); // Pushes key_1 into Probation
+        cache.upsert("key_2".to_string(), "val_2".to_string());
 
-        assert_eq!(cache.index_map.get("key_1"), Some(&Location::Probation));
+        assert_eq!(location_of(&cache, "key_1"), Some(Location::Probation));
 
-        // Reading "key_1" while it lives in Probation must promote it to Protected
         let val = cache.get("key_1");
         assert_eq!(val, Some("val_1"));
-        assert_eq!(cache.index_map.get("key_1"), Some(&Location::Protected));
-        assert_eq!(cache.protected_queue.len(), 1);
+        assert_eq!(location_of(&cache, "key_1"), Some(Location::Protected));
+        assert_eq!(cache.protected.len, 1);
         cache.debug_integrity();
     }
 
     #[test]
     fn test_protected_demotion_cascade() {
-        let mut cache = setup_small_cache(); // Protected size = 8, Probation = 1, Window = 1
+        let mut cache = setup_small_cache();
 
-        // 1. Fill up the entire Protected segment (8 slots) via probation promotions
         for i in 0..8 {
-            let k = format!("hot_{}", i);
-            cache.upsert(k.clone(), format!("val_{}", i));
-            cache.upsert("stub".to_string(), "stub".to_string()); // Overflows window to move 'hot_i' out
-            cache.get(&k); // Promote 'hot_i' to Protected
+            let hot_key = format!("hot_{}", i);
+            let idx = cache.alloc_node(hot_key.clone(), format!("val_{}", i));
+            cache.push_back(idx, Location::Protected);
         }
-        assert_eq!(cache.protected_queue.len(), 8);
 
-        // 2. Put a marked item at the LRU position (head of Protected queue)
-        // By reading "hot_0" first, it was pushed back. "hot_0" is currently the oldest item.
-        assert_eq!(cache.protected_queue.front().unwrap().key, "hot_0");
+        let candidate_idx = cache.alloc_node("new_hot".to_string(), "new_val".to_string());
+        cache.push_back(candidate_idx, Location::Probation);
 
-        // 3. Promote a new item into Protected, triggering a demotion cascade
-        cache.upsert("new_hot".to_string(), "new_val".to_string());
-        cache.upsert("stub2".to_string(), "stub2".to_string()); // move out of window
-        cache.get("new_hot"); // Promote to Protected
+        assert_eq!(cache.protected.len, 8);
+        assert_eq!(
+            cache.segment_keys(Location::Protected).first().copied(),
+            Some("hot_0")
+        );
 
-        // "hot_0" should be demoted from Protected to Probation
-        assert_eq!(cache.index_map.get("hot_0"), Some(&Location::Probation));
-        assert_eq!(cache.protected_queue.len(), 8); // Still maxed out
+        cache.get("new_hot");
+
+        assert_eq!(location_of(&cache, "hot_0"), Some(Location::Probation));
+        assert_eq!(location_of(&cache, "new_hot"), Some(Location::Protected));
+        assert_eq!(cache.protected.len, 8);
         cache.debug_integrity();
+    }
+
+    #[test]
+    fn test_tiny_capacities_do_not_underflow() {
+        let mut cache = WTinyLfu::new(1);
+
+        cache.upsert("only".to_string(), "value".to_string());
+        assert_eq!(cache.get("only"), Some("value"));
+        cache.debug_integrity();
+
+        let zero_cache = WTinyLfu::new(0);
+        assert_eq!(zero_cache.window_max, 0);
+        assert_eq!(zero_cache.probation_max, 0);
+        assert_eq!(zero_cache.protected_max, 0);
     }
 }
