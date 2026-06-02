@@ -4,14 +4,15 @@ use eviction::Cache;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use plotters::prelude::*;
-use plotters::style::text_anchor::{HPos, Pos, VPos};
 use textplots::{Chart, Plot, Shape};
 use tabular::{Table, Row};
 use rand::Rng;
 
 use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
+use std::path::Path;
 use std::time::Instant;
 use std::io::{self};
 
@@ -37,6 +38,7 @@ struct CacheConfig {
 
 #[derive(Debug)]
 struct Workload {
+    id: String,
     num_keys: usize,
     total_ops: usize,
     total_cache_capacity: usize,
@@ -59,18 +61,87 @@ struct Performance {
     hit_rate: f32
 }
 
+#[derive(Debug)]
+struct BenchmarkConfig {
+    zipf_alpha: f64,
+    read_percentage: f64,
+    protected_segment_ratio: f32,
+    workloads: Vec<Workload>,
+}
+
+impl BenchmarkConfig {
+    fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config = Self {
+            zipf_alpha: 1.03,
+            read_percentage: 30.0,
+            protected_segment_ratio: 0.65,
+            workloads: Vec::new(),
+        };
+
+        for line in fs::read_to_string(path)?.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+
+            match key.trim() {
+                "zipf_alpha" => config.zipf_alpha = value.trim().parse()?,
+                "read_percentage" => config.read_percentage = value.trim().parse()?,
+                "protected_segment_ratio" => config.protected_segment_ratio = value.trim().parse()?,
+                _ => {
+                    let Some(workload_key) = key.trim().strip_prefix("workload.") else {
+                        continue;
+                    };
+                    let Some((workload_id, field)) = workload_key.rsplit_once('.') else {
+                        continue;
+                    };
+
+                    let workload = if let Some(existing) = config.workloads.iter_mut().find(|w| w.id == workload_id) {
+                        existing
+                    } else {
+                        config.workloads.push(Workload {
+                            id: workload_id.to_string(),
+                            name: workload_id.to_string(),
+                            num_keys: 0,
+                            total_ops: 0,
+                            total_cache_capacity: 0,
+                            eviction_budget: 0,
+                        });
+                        config.workloads.last_mut().unwrap()
+                    };
+
+                    match field {
+                        "name" => workload.name = value.trim().to_string(),
+                        "num_keys" => workload.num_keys = value.trim().parse()?,
+                        "total_ops" => workload.total_ops = value.trim().parse()?,
+                        "total_cache_capacity" => workload.total_cache_capacity = value.trim().parse()?,
+                        "eviction_budget" => workload.eviction_budget = value.trim().parse()?,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(config)
+    }
+}
+
 pub fn generate_random_key<R: Rng>(keyspace_size: usize, rng: &mut R) -> u64 {
     // gen_range is right-exclusive, so 0..keyspace_size yields [0, keyspace_size - 1]
     rng.gen_range(0..keyspace_size) as u64
 }
 
-fn run_workload(cache: &mut dyn Cache, num_keys: usize, total_ops: usize, cold_keys: usize, workload_name: String) -> Performance {
+fn run_workload(cache: &mut dyn Cache, num_keys: usize, total_ops: usize, cold_keys: usize, workload_name: String, benchmark_config: &BenchmarkConfig) -> Performance {
     println!(" ---------------- {} : {} =>", cache.name(), workload_name);
     let mut rng = StdRng::seed_from_u64(42);
 
     // Zipf s=1.03 is the industry standard for database/cache benchmarks (YCSB)
     // We use a key universe larger than the cache (10,000 keys for a 2,000 capacity)
-    let zipf = ZipfDistribution::new(num_keys, 1.03).unwrap();
+    let zipf = ZipfDistribution::new(num_keys, benchmark_config.zipf_alpha).unwrap();
     let mut hits = 0;
     let mut miss = 0;
 
@@ -97,10 +168,10 @@ fn run_workload(cache: &mut dyn Cache, num_keys: usize, total_ops: usize, cold_k
     let start_time = Instant::now();
 
     for i in 0..total_ops {
-        if rng.gen_bool(0.3) { // 30% Random Writes
+        if rng.gen_bool(benchmark_config.read_percentage / 100.0) { // Random writes based on config
             let random_key = generate_random_key(num_keys, &mut rng);
             cache.upsert(random_key.to_string(), "value".into());
-        } else { // 70% Zipfian Reads
+        } else { // Zipfian Reads
             let idx = zipf.sample(&mut rng) - 1;
             let key = format!("key_{}", idx);
 
@@ -143,40 +214,8 @@ fn run_workload(cache: &mut dyn Cache, num_keys: usize, total_ops: usize, cold_k
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut workload_data: Vec<Workload> = Vec::new();
-    workload_data.push(Workload {
-        num_keys: 1_000_000,
-        total_ops: 10_000_000,
-        total_cache_capacity: 250_000,
-        eviction_budget: 1,
-        name: "SMALL LOAD".to_string(),
-    });
-
-    workload_data.push(Workload{
-        num_keys: 5_000_000,
-        total_ops: 50_000_000,
-        total_cache_capacity: 1_250_000,
-        eviction_budget: 1,
-        name: "MEDIUM LOAD".to_string(),
-    });
-
-    // workload_data.push(Workload{
-    //     num_keys: 10_000_000,
-    //     total_ops: 100_000_000,
-    //     total_cache_capacity: 2_500_000,
-    //     eviction_budget: 1,
-    //     name: "LARGE LOAD".to_string(),
-    // });
-
-    // workload_data.push(Workload{
-    //     num_keys: 20_000_000,
-    //     total_ops: 200_000_000,
-    //     total_cache_capacity: 5_000_000,
-    //     eviction_budget: 1,
-    //     name: "VERY LARGE LOAD".to_string(),
-    // });
-
-    let protected_segment_ratio = 0.65; // Obtained by running cache_bench.rs. We took the average of 4 type of load we ran last time.
+    let benchmark_config = BenchmarkConfig::from_file("compare.conf")?;
+    let protected_segment_ratio = benchmark_config.protected_segment_ratio;
 
     let mut perf_segmented_sieve: Vec<(String, Performance)> = Vec::new();
     let mut perf_sieve: Vec<(String, Performance)> = Vec::new();
@@ -187,34 +226,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut hit_rate: f32;
     let mut perf;
-    for config in workload_data {
+    for config in &benchmark_config.workloads {
         let workload_name = config.name.clone();
         let protected_size = (protected_segment_ratio * config.total_cache_capacity as f32) as usize;
         let mut b_map = MemoryBoundedMap::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget, 1);
-        perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut b_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone(), &benchmark_config);
         perf_segmented_sieve.push((workload_name.clone(), perf));
 
         let mut sieve = SieveMap::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut sieve, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone(), &benchmark_config);
         perf_sieve.push((workload_name.clone(), perf));
 
 
         let mut lru = LruCache::new(config.total_cache_capacity, config.total_cache_capacity - 200, config.eviction_budget);
-        perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone(), &benchmark_config);
         perf_lru.push((workload_name.clone(), perf));
 
 
         let probation_size = config.total_cache_capacity - protected_size;
         let mut segmented_lru = SegmentedLruCache::new(config.total_cache_capacity, protected_size, probation_size, probation_size - 100, protected_size - 100, config.eviction_budget, config.eviction_budget, 1);
-        perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut segmented_lru, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone(), &benchmark_config);
         perf_segmented_lru.push((workload_name.clone(), perf));
 
         let mut hybrid_map = HybridTinyLFU::new(protected_size, protected_size - 100, config.total_cache_capacity - protected_size, config.eviction_budget);
-        perf = run_workload(&mut hybrid_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone());
+        perf = run_workload(&mut hybrid_map, config.num_keys, config.total_ops, config.total_cache_capacity, workload_name.clone(), &benchmark_config);
         perf_hybrid_tiny_lfu.push((workload_name.clone(), perf));
 
         let mut tiny_map = WTinyLfu::new(config.total_cache_capacity);
-        perf = run_workload(&mut tiny_map, config.num_keys, config.total_ops, config.total_cache_capacity/2, workload_name.clone());
+        perf = run_workload(&mut tiny_map, config.num_keys, config.total_ops, config.total_cache_capacity/2, workload_name.clone(), &benchmark_config);
         perf_w_tiny_lfu.push((workload_name.clone(), perf));
     }
 
@@ -235,10 +274,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 use plotters::prelude::*;
 
+fn prepare_output_path(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = Path::new(file_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn plot_perf(
     algorithms: &[(&str, Vec<(String, Performance)>)],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = "algorithm_comparison_65_2.png";
+    let file_path = "assets/algorithm_comparison_hit.png";
+    prepare_output_path(file_path)?;
     let root = BitMapBackend::new(file_path, (840, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -265,8 +315,6 @@ fn plot_perf(
     let y_padding = (spread * 0.35).max(1.0);
     let y_min = (min_value - y_padding).max(0.0);
     let y_max = (max_value + y_padding).min(100.0);
-    let label_step = (spread * 0.04).max(0.15); // Fine-tuned step size for compact ranges
-
     let mut chart = ChartBuilder::on(&root)
         .caption("Eviction Policy Comparison: Hit Rate vs Load Scale", ("roboto", 25))
         .margin(50)
@@ -297,13 +345,6 @@ fn plot_perf(
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
-        // FIXED: Alternate labels above/below node points to eliminate overlap collisions
-        let (v_pos, y_modifier) = if algo_idx % 2 == 0 {
-            (VPos::Bottom, label_step)
-        } else {
-            (VPos::Top, -label_step)
-        };
-
         // 1. Draw the connecting lines
         chart.draw_series(LineSeries::new(
             dataset
@@ -318,18 +359,6 @@ fn plot_perf(
         // 2. Draw colored dots at each node
         chart.draw_series(dataset.iter().enumerate().map(|(i, (_, perf))| {
             Circle::new((i as f32, perf.hit_rate), 5, ShapeStyle::from(&base_color).filled())
-        }))?;
-
-        // 3. Float the numeric hit-rate values right above/below the points
-        chart.draw_series(dataset.iter().enumerate().map(|(i, (_, perf))| {
-            Text::new(
-                format!("{:.2}%", perf.hit_rate),
-                (i as f32, perf.hit_rate + y_modifier),
-                ("roboto", 11)
-                    .into_font()
-                    .color(&base_color)
-                    .pos(Pos::new(HPos::Center, v_pos)),
-            )
         }))?;
     }
 
@@ -346,7 +375,8 @@ fn plot_perf(
 fn plot_throughput(
     performances: &[(&str, Vec<(String, Performance)>)],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = "algorithm_throughput_comparison.png";
+    let file_path = "assets/algorithm_throughput_comparison.png";
+    prepare_output_path(file_path)?;
     let root = BitMapBackend::new(file_path, (840, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -372,8 +402,6 @@ fn plot_throughput(
     let y_padding = (spread * 0.35).max(1.0);
     let y_min = (min_value - y_padding).max(0.0);
     let y_max = max_value + y_padding;
-    let label_step = (spread * 0.04).max(1.0);
-
     let mut chart = ChartBuilder::on(&root)
         .caption("Eviction Policy Comparison: Throughput vs Load Scale", ("roboto", 25))
         .margin(50)
@@ -404,13 +432,6 @@ fn plot_throughput(
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
-        // FIXED: Alternate labels above/below node points to eliminate overlap collisions
-        let (v_pos, y_modifier) = if algo_idx % 2 == 0 {
-            (VPos::Bottom, label_step)
-        } else {
-            (VPos::Top, -label_step)
-        };
-
         chart.draw_series(LineSeries::new(
             dataset.iter().enumerate().map(|(i, val)| (i as f64, val.1.throughput)),
             line_style,
@@ -420,17 +441,6 @@ fn plot_throughput(
 
         chart.draw_series(dataset.iter().enumerate().map(|(i, val)| {
             Circle::new((i as f64, val.1.throughput), 5, ShapeStyle::from(&base_color).filled())
-        }))?;
-
-        chart.draw_series(dataset.iter().enumerate().map(|(i, val)| {
-            Text::new(
-                format!("{:.2}", val.1.throughput),
-                (i as f64, val.1.throughput + y_modifier),
-                ("roboto", 11)
-                    .into_font()
-                    .color(&base_color)
-                    .pos(Pos::new(HPos::Center, v_pos)),
-            )
         }))?;
     }
 
@@ -447,7 +457,8 @@ fn plot_throughput(
 fn plot_average_latency(
     performances: &[(&str, Vec<(String, Performance)>)],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = "algorithm_latency_comparison.png";
+    let file_path = "assets/algorithm_latency_comparison.png";
+    prepare_output_path(file_path)?;
     let root = BitMapBackend::new(file_path, (840, 600)).into_drawing_area();
     root.fill(&WHITE)?;
 
@@ -473,8 +484,6 @@ fn plot_average_latency(
     let y_padding = (spread * 0.35).max(1.0);
     let y_min = (min_value - y_padding).max(0.0);
     let y_max = max_value + y_padding;
-    let label_step = (spread * 0.04).max(1.0);
-
     let mut chart = ChartBuilder::on(&root)
         .caption("Eviction Policy Comparison: Avg Latency vs Load Scale", ("roboto", 25))
         .margin(50)
@@ -505,13 +514,6 @@ fn plot_average_latency(
         };
         let line_style = ShapeStyle::from(&base_color).stroke_width(1);
 
-        // FIXED: Alternate labels above/below node points to eliminate overlap collisions
-        let (v_pos, y_modifier) = if algo_idx % 2 == 0 {
-            (VPos::Bottom, label_step)
-        } else {
-            (VPos::Top, -label_step)
-        };
-
         chart.draw_series(LineSeries::new(
             dataset.iter().enumerate().map(|(i, val)| (i as f64, val.1.avg_latency_ns)),
             line_style,
@@ -521,17 +523,6 @@ fn plot_average_latency(
 
         chart.draw_series(dataset.iter().enumerate().map(|(i, val)| {
             Circle::new((i as f64, val.1.avg_latency_ns), 5, ShapeStyle::from(&base_color).filled())
-        }))?;
-
-        chart.draw_series(dataset.iter().enumerate().map(|(i, val)| {
-            Text::new(
-                format!("{:.2}", val.1.avg_latency_ns),
-                (i as f64, val.1.avg_latency_ns + y_modifier),
-                ("roboto", 11)
-                    .into_font()
-                    .color(&base_color)
-                    .pos(Pos::new(HPos::Center, v_pos)),
-            )
         }))?;
     }
 

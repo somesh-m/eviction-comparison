@@ -1,3 +1,9 @@
+//! A hybrid segmented cache that combines blind admission into a circular
+//! probation buffer with frequency-aware promotion into a protected segment.
+//! New keys always enter probation first, while a Count-Min Sketch estimates
+//! access frequency to decide whether a probation hit should displace a
+//! protected entry or remain in probation.
+
 use hashbrown::HashMap;
 use tabular::{Table, Row};
 use crate::Cache;
@@ -338,22 +344,16 @@ impl HybridTinyLFU {
             }
 
             None => {
+                // BLIND ADMISSION: New keys are always allowed into the probation ring-buffer.
+                // This prevents cache-freezing and allows new keys to accumulate frequency hits.
                 let pos = self.probation_hand;
 
-                // TINYLFU ADMISSION WINDOW:
-                // Check if incoming key is hotter than the victim currently sitting at probation_hand
-                if let Some(old_item) = &self.probation_pool[pos] {
-                    if self.sketch.count(&key) < self.sketch.count(&old_item.key) {
-                        // Incoming key is colder than the victim. Reject admission to protect cache!
-                        return;
-                    }
-                }
-
-                // Evict the victim if it survived or if slot was filled
+                // Evict the current victim at the hand position to make room
                 if let Some(old_item) = self.probation_pool[pos].take() {
                     self.index_map.remove(&old_item.key);
                 }
 
+                // Insert the new item
                 self.probation_pool[pos] = Some(ValueMeta {
                     key: key.clone(),
                     value,
